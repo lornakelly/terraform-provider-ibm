@@ -46,9 +46,16 @@ const (
 )
 
 const (
-	databaseTaskSuccessStatus  = "completed"
-	databaseTaskProgressStatus = "running"
-	databaseTaskFailStatus     = "failed"
+	databaseTaskCompletedStatus = "completed"
+	databaseTaskQueuedStatus    = "queued"
+	databaseTaskRunningStatus   = "running"
+	databaseTaskFailedStatus    = "failed"
+	databaseTaskExpiredStatus   = "expired"
+)
+
+const (
+	taskUpgrade = "upgrade"
+	taskRestore = "restore"
 )
 
 const (
@@ -141,7 +148,9 @@ func ResourceIBMDatabaseInstance() *schema.Resource {
 			resourceIBMDatabaseInstanceDiff,
 			validateGroupsDiff,
 			validateUsersDiff,
-			validateRemoteLeaderIDDiff),
+			validateRemoteLeaderIDDiff,
+			validateVersionDiff,
+		),
 
 		Importer: &schema.ResourceImporter{},
 
@@ -241,11 +250,15 @@ func ResourceIBMDatabaseInstance() *schema.Resource {
 				Description: "The configuration schema in JSON format",
 			},
 			"version": {
-				Description: "The database version to provision if specified",
+				Description: "The database version to provision if specified or the database version to upgrade to",
 				Type:        schema.TypeString,
-				Optional:    true,
 				Computed:    true,
-				ForceNew:    true,
+				Optional:    true,
+			},
+			"version_upgrade_skip_backup": {
+				Description: "Option to skip the backup when upgrading the version of your db. Only applicable to databases that do not support PITR. Skipping the backup means that your deployment becomes available more quickly, but there is no immediate backup available. This is not recommended as it could result in data loss",
+				Type:        schema.TypeBool,
+				Optional:    true,
 			},
 			"service_endpoints": {
 				Description:  "Types of the service endpoints. Possible values are 'public', 'private', 'public-and-private'.",
@@ -2198,7 +2211,63 @@ func resourceIBMDatabaseInstanceUpdate(context context.Context, d *schema.Resour
 		}
 	}
 
+	if d.HasChange("version") {
+		//TODO LORNA: test new endpoint end to end
+		version := d.Get("version").(string)
+		skipBackup := d.Get("version_upgrade_skip_backup") == true
+
+		timeoutHelper := TimeoutHelper{Now: time.Now()}
+		expirationDatetime := timeoutHelper.calculateExpirationDatetime(d.Timeout(schema.TimeoutUpdate))
+
+		log.Printf("[INFO] Change version testing %s, %v, %s", version, skipBackup, expirationDatetime)
+
+		// Check if a version upgrade task is already in progress
+		tm := &TaskManager{
+			Client:     cloudDatabasesClient,
+			InstanceID: instanceID,
+		}
+
+		upgradeInProgress, currentTask, err := tm.matchingTaskInProgress(taskUpgrade)
+		if err != nil {
+			return diag.FromErr(fmt.Errorf("[ERROR] Error getting tasks for instance: %w", err))
+		}
+
+		if upgradeInProgress {
+			log.Printf("[INFO] Upgrade task already in progress, waiting for it to complete: %s", *currentTask.ID)
+			_, err = waitForDatabaseTaskComplete(*currentTask.ID, d, meta, d.Timeout(schema.TimeoutUpdate))
+			if err != nil {
+				return diag.FromErr(fmt.Errorf("[ERROR] error waiting for version upgrade task to complete: %w", err))
+			}
+		} else {
+			log.Printf("[INFO] Triggering upgrade to version %s", version)
+			versionUpgradeOptions := &clouddatabasesv5.SetDatabaseInplaceVersionUpgradeOptions{
+				ID:                 core.StringPtr(instanceID),
+				Version:            core.StringPtr(version),
+				SkipBackup:         core.BoolPtr(skipBackup),
+				ExpirationDatetime: &expirationDatetime,
+			}
+
+			versionUpgradeResponse, response, err := cloudDatabasesClient.SetDatabaseInplaceVersionUpgrade(versionUpgradeOptions)
+
+			if err != nil {
+				return diag.FromErr(fmt.Errorf("[ERROR] error upgrading version of instance: %v\nResponse: %v", err, response))
+			}
+
+			if versionUpgradeResponse == nil || versionUpgradeResponse.Task == nil || versionUpgradeResponse.Task.ID == nil {
+				return diag.FromErr(fmt.Errorf("[ERROR] received nil for version upgrade"))
+			}
+
+			taskID := *versionUpgradeResponse.Task.ID
+
+			_, err = waitForDatabaseTaskComplete(taskID, d, meta, d.Timeout(schema.TimeoutUpdate))
+			if err != nil {
+				return diag.FromErr(fmt.Errorf("[ERROR] error waiting for version upgrade task to complete: %w", err))
+			}
+		}
+	}
+
 	return resourceIBMDatabaseInstanceRead(context, d, meta)
+
 }
 
 func resourceIBMDatabaseInstanceDelete(context context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
@@ -2397,11 +2466,13 @@ func waitForDatabaseTaskComplete(taskId string, d *schema.ResourceData, meta int
 			}
 
 			switch *getTaskResponse.Task.Status {
-			case "failed":
+			case databaseTaskExpiredStatus:
+				return false, fmt.Errorf("[Error] Database Task expired")
+			case databaseTaskFailedStatus:
 				return false, fmt.Errorf("[Error] Database Task failed")
-			case "complete", "":
+			case databaseTaskCompletedStatus, "":
 				return true, nil
-			case "queued", "running":
+			case databaseTaskQueuedStatus, databaseTaskRunningStatus:
 				break
 			}
 		}
@@ -3128,6 +3199,43 @@ func validateRemoteLeaderIDDiff(_ context.Context, diff *schema.ResourceDiff, me
 	}
 
 	return nil
+}
+
+func validateVersionDiff(_ context.Context, diff *schema.ResourceDiff, meta interface{}) (err error) {
+	instanceID := diff.Id()
+	oldVersion, newVersion := diff.GetChange("version")
+
+	if instanceID == "" || oldVersion == newVersion {
+		return nil
+	}
+
+	cloudDatabasesClient, err := meta.(conns.ClientSession).CloudDatabasesV5()
+	if err != nil {
+		return fmt.Errorf("[ERROR] Error getting database client settings: %w", err)
+	}
+
+	tm := &TaskManager{
+		Client:     cloudDatabasesClient,
+		InstanceID: instanceID,
+	}
+
+	// Check if a version upgrade task is already in progress
+	upgradeInProgress, task, err := tm.matchingTaskInProgress(taskUpgrade)
+	if err != nil {
+		return fmt.Errorf("[ERROR] Error getting tasks for instance: %w", err)
+	}
+
+	if upgradeInProgress {
+		// Skip validation if task is already running as the version value could change on instance before task is complete and it would already have been validated
+		log.Printf("[INFO] Upgrade task already in progress: %s", *task.ID)
+		return nil
+	}
+
+	skipBackup := diff.Get("version_upgrade_skip_backup") == true
+	newVersionStr, _ := newVersion.(string)
+	location := diff.Get("location").(string)
+
+	return validateUpgradeVersion(instanceID, location, newVersionStr, skipBackup, meta)
 }
 
 func (c *userChange) isDelete() bool {
